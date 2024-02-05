@@ -1,6 +1,4 @@
-MODULE classFieldArray
-   !
-   !
+MODULE classFieldArray  !! KEKSI JOKU MUU NIMI, MENEE SEKASIN FLOATARRAYN KANSSA
    USE classArrayElement, ONLY : ArrayElement
    USE mo_structured_datatypes
 
@@ -26,10 +24,13 @@ MODULE classFieldArray
 
          PROCEDURE :: NewField
 
+         PROCEDURE :: getNvars
+
          PROCEDURE :: getField
 
          PROCEDURE :: getFieldIndex
          
+         PROCEDURE :: isInGroup
          PROCEDURE :: getByGroup
          PROCEDURE :: getByOutputstatus
          
@@ -76,7 +77,6 @@ MODULE classFieldArray
       ! Initialize a FieldArray instance: just puts count to zero and
       ! sets up some switches with initial values
       !
-      IMPLICIT NONE
       TYPE(FieldArray) :: FieldArray_constructor
 
       FieldArray_constructor%count = 0
@@ -90,11 +90,11 @@ MODULE classFieldArray
    !
    SUBROUTINE newField(SELF,name,dimension,counts_local,counts_global,   &
                        axis_offsets,p_data,t_data,c_data,outputstatus,long_name,unit,group)
+      USE mo_parameters, ONLY : ch_long, ch_short
       !
       ! ------------------------------------------------------------
       ! Create a new variable in the FieldArray list
       !
-      IMPLICIT NONE
       CLASS(FieldArray), INTENT(inout)         :: SELF
       CHARACTER(len=*), INTENT(in)             :: name     ! Variable name
       CHARACTER(len=*), INTENT(in)             :: dimension(:)     ! String that gives the dimension environment for output
@@ -108,10 +108,9 @@ MODULE classFieldArray
       CHARACTER(len=*), INTENT(in), OPTIONAL   :: long_name     ! Long name, mainly for output attributes, default empty
       CHARACTER(len=*), INTENT(in), OPTIONAL   :: unit          ! Unit of the variable, e.g. "kg/kg"; used mainly for output attributes, default empty
       CHARACTER(len=*), INTENT(in), OPTIONAL   :: group(:)
- 
+
       ! Extend the variable list allocation in FieldArray
       CALL SELF%Extend()
-
       ! Pass the input data and parameters to ArrayElement constructor
       SELF%list(SELF%count) = ArrayElement(name,long_name,unit,dimension,counts_local,counts_global,  &
                                            axis_offsets,outputstatus,p_data,t_data,c_data,group)
@@ -126,23 +125,21 @@ MODULE classFieldArray
       ! Extend the memory allocation of the "list" in FieldArray.
       ! Mainly intended to be used by newField procedure
       !
-      IMPLICIT NONE
       CLASS(FieldArray), INTENT(inout) :: SELF
 
       TYPE(ArrayElement), ALLOCATABLE :: tmp(:)
 
-      IF (SELF%Initialized) THEN
+      SELF%count = SELF%count + 1
 
-         ALLOCATE(tmp(SELF%count+1))
-         tmp(1:SELF%count) = SELF%list
+      IF (SELF%Initialized) THEN
+         ALLOCATE(tmp(SELF%count))
+         tmp(1:SELF%count-1) = SELF%list
          DEALLOCATE(SELF%list)
          CALL MOVE_ALLOC(tmp,SELF%list)
-       
       ELSE
-         ALLOCATE(SELF%list(SELF%count+1))
+         ALLOCATE(SELF%list(SELF%count))
       END IF
 
-      SELF%count = SELF%count + 1
       SELF%Initialized = .TRUE.
 
    END SUBROUTINE Extend_FieldArray
@@ -155,7 +152,6 @@ MODULE classFieldArray
       ! Extend the memory allocation of the "list" in FieldArray.
       ! Mainly intended to be used by newField procedure
       !
-      IMPLICIT NONE
       CLASS(FieldArray), INTENT(inout) :: SELF
       INTEGER, INTENT(in) :: n
 
@@ -184,8 +180,6 @@ MODULE classFieldArray
    ! index "ind" of the FieldArray list.
    !
    SUBROUTINE getField(SELF,out,ind,name)
-
-      IMPLICIT NONE
       CLASS(FieldArray), TARGET, INTENT(in) :: SELF
       INTEGER, INTENT(in), OPTIONAL :: ind
       CHARACTER(len=*), INTENT(in), OPTIONAL :: name
@@ -203,6 +197,29 @@ MODULE classFieldArray
 
    END SUBROUTINE getField
 
+   ! -------------------------
+   ! 
+   !
+   FUNCTION getNvars(SELF)
+      CLASS(FieldArray), INTENT(in) :: SELF 
+      INTEGER :: getNvars
+      getNvars = SELF%count
+   END FUNCTION getNvars 
+
+   ! ----------------------------------------------------------------------------
+   ! isInGroup: returns boolean if variable specified by *key* belongs to
+   ! a group *groupname*
+   !
+   FUNCTION isInGroup(SELF,groupname,key)
+      CLASS(FieldArray), INTENT(in) :: SELF 
+      CHARACTER(len=*), INTENT(in)   :: groupname
+      CLASS(*), INTENT(in) :: key
+      LOGICAL :: isInGroup
+      INTEGER :: ind
+      ind = SELF%convertToIndex(key)
+      isInGroup = ANY(SELF%list(ind)%getGroups() == groupname)
+   END FUNCTION isInGroup
+
    ! -----------------------------------------------------------------------------
    ! getGroup returns a FieldArray instance, which contains a subset of variables
    ! from the parent FieldArray instance that belong to the inquired group. Whether
@@ -210,7 +227,6 @@ MODULE classFieldArray
    ! FieldArray%Initialized.
    ! 
    SUBROUTINE getByGroup(SELF,groupname,FAout)
-     IMPLICIT NONE
      CLASS(FieldArray), INTENT(in)  :: SELF
      CHARACTER(len=*), INTENT(in)   :: groupname
      TYPE(FieldArray), INTENT(out) :: FAout
@@ -235,7 +251,6 @@ MODULE classFieldArray
    END SUBROUTINE getByGroup
 
    SUBROUTINE getByOutputstatus(SELF,FAout)
-     IMPLICIT NONE
      CLASS(FieldArray), INTENT(in) :: SELF
      TYPE(FieldArray), INTENT(out) :: FAout
 
@@ -274,7 +289,6 @@ MODULE classFieldArray
    ! getData_2d, getData_3d and getData_4d bound to FieldArray.
    !
    SUBROUTINE getData_0d(SELF,out,tlev,key)
-      IMPLICIT NONE
       CLASS(FieldArray), INTENT(in)            :: SELF
       TYPE(FloatArray0d), INTENT(out), POINTER :: out    ! Data container instance
       CLASS(*), INTENT(in)                     :: key    ! Variable name (CHARACTER) or list index (INTEGER)
@@ -300,7 +314,6 @@ MODULE classFieldArray
    ! ---------
    ! ---------
    SUBROUTINE getData_1d(SELF,out,tlev,key)
-      IMPLICIT NONE
       CLASS(FieldArray), INTENT(in)            :: SELF
       TYPE(FloatArray1d), INTENT(out), POINTER :: out    ! Data container instance
       CLASS(*), INTENT(in)                     :: key    ! Variable name (CHARACTER) or list index (INTEGER)
@@ -325,7 +338,6 @@ MODULE classFieldArray
    ! ---------
    ! ---------
    SUBROUTINE getData_2d(SELF,out,tlev,key)
-      IMPLICIT NONE
       CLASS(FieldArray), INTENT(in)            :: SELF
       TYPE(FloatArray2d), INTENT(out), POINTER :: out    ! Data container instance
       CLASS(*), INTENT(in)                     :: key    ! Variable name (CHARACTER) or list index (INTEGER)
@@ -350,7 +362,6 @@ MODULE classFieldArray
    ! ---------
    ! ---------
    SUBROUTINE getData_3d(SELF,out,tlev,key)
-      IMPLICIT NONE
       CLASS(FieldArray), INTENT(in)            :: SELF
       TYPE(FloatArray3d), INTENT(out), POINTER :: out    ! Data container instance
       CLASS(*), INTENT(in)                     :: key    ! Variable name (CHARACTER) or list index (INTEGER) 
@@ -375,7 +386,6 @@ MODULE classFieldArray
    ! ---------
    ! ---------
    SUBROUTINE getData_4d(SELF,out,tlev,key)
-      IMPLICIT NONE
       CLASS(FieldArray), INTENT(in)            :: SELF
       TYPE(FloatArray4d), INTENT(out), POINTER :: out    ! Data container instance
       CLASS(*), INTENT(in)                     :: key    ! Variable name (CHARACTER) or list index (INTEGER) 
@@ -441,7 +451,7 @@ MODULE classFieldArray
       CHARACTER(len=:), ALLOCATABLE :: getDimension(:)
       INTEGER :: ind
       ind = SELF%convertToIndex(key)
-      getDimension = SELF%list(ind)%getDimension()
+      getDimension=SELF%list(ind)%getDimension()
    END FUNCTION getDimension
 
    ! -----------------------------------------------------------------
@@ -480,13 +490,14 @@ MODULE classFieldArray
    ! -----------------------------------------------------------------
 
    FUNCTION getCountsLocal(SELF,key)
-      CLASS(FieldArray), INTENT(in) :: SELF
+      CLASS(FieldArray), INTENT(inout) :: SELF
       CLASS(*), INTENT(in) :: key
       INTEGER, ALLOCATABLE :: getCountsLocal(:)
       INTEGER :: ind
       ind = SELF%convertToIndex(key)
       getCountsLocal = SELF%list(ind)%getCountsLocal()
    END FUNCTION getCountsLocal
+
 
    ! -----------------------------------------------------------------
 
@@ -503,11 +514,11 @@ MODULE classFieldArray
 
    FUNCTION getOffsets(SELF,key)
       CLASS(FieldArray), INTENT(in) :: SELF
-      CLASS(*), INTENT(in) :: key
+      CLASS(*), INTENT(in) :: key            ! Type INTEGER or CHARACTER
       INTEGER, ALLOCATABLE :: getOffsets(:)
       INTEGER :: ind 
-      ind = SELF%convertToIndex(key)
-      getOffsets = SELF%list(ind)%getOffsets()
+      ind = SELF%convertToIndex(key)   ! In case key is a CHARACTER for variable name, convert to index
+      getOffsets = SELF%list(ind)%getOffsets() ! Add error handling for ind = 0
    END FUNCTION getOffsets
 
    ! -----------------------------------------------------------------
@@ -576,7 +587,6 @@ MODULE classFieldArray
    ! ---------------------------------------------------------------
 
    SUBROUTINE destroy_FieldArray(SELF)
-      IMPLICIT NONE
       CLASS(FieldArray), INTENT(inout) :: SELF
     
       DEALLOCATE(SELF%list)

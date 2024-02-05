@@ -1,25 +1,31 @@
 MODULE classOStreamNCDF
     USE netcdf
+    IMPLICIT NONE
 
     TYPE OStreamNCDF
 
-        INTEGER :: ncid = 0
-        INTEGER :: nrec = 0
-        INTEGER :: nvar
-        CHARACTER(len=150) :: fname
+        INTEGER :: ncid = 0         ! File ID handle for the stream
+        INTEGER :: nrec = 0         ! Current number of records
+        INTEGER :: recdid = -1    ! Record dimension ID (assume only 1, if any)
+        INTEGER :: nvar             ! Number of variables defined for the stream
+        CHARACTER(len=150) :: fname ! Output filename for the stream
+        
 
         CONTAINS
 
         PROCEDURE :: open_nc,           &
                      sync_nc,           &
                      close_nc,          &
-                     define_record,     &
+                     finalize_init,     &
+                     newRecord,         &
                      define_dimensions, &
                      define_variables,  &
-                     write_new_record,  &
                      write_var
 
-        PROCEDURE, PRIVATE :: get_dimids
+        PROCEDURE, PRIVATE :: get_dimids,    &
+                              updateOffset,  &
+                              findRecordIdx, &
+                              excludeRecord
 
 
     END TYPE OStreamNCDF
@@ -44,6 +50,7 @@ MODULE classOStreamNCDF
         CLASS(OStreamNCDF), INTENT(inout) :: SELF
         INTEGER :: iret
         iret = nf90_create(SELF%fname,NF90_SHARE,SELF%ncid)
+        SELF%nrec = 0  !! This has to have some additional stuff for opening pre-existing files
     END SUBROUTINE open_nc
 
     ! ------------------------------
@@ -55,6 +62,14 @@ MODULE classOStreamNCDF
     END SUBROUTINE sync_nc
 
     ! ------------------------------
+    SUBROUTINE finalize_init(SELF)
+        CLASS(OStreamNCDF), INTENT(inout) :: SELF
+        INTEGER :: err
+        err = nf90_enddef(SELF%ncid)
+        CALL SELF%sync_nc()
+    END SUBROUTINE finalize_init
+
+    ! --------------------------------
 
     SUBROUTINE close_nc(SELF)
         CLASS(OStreamNCDF), INTENT(inout) :: SELF 
@@ -62,33 +77,46 @@ MODULE classOStreamNCDF
         iret = nf90_close(SELF%ncid) 
     END SUBROUTINE close_nc 
 
-    ! ------------------------------
 
-    SUBROUTINE define_record(SELF,name,longname,unit)
-        ! ----------------------------------------------
-        ! Define the record variable
-        ! ---------------------------
-        CLASS(OStreamNCDF), INTENT(inout) :: SELF
-        CHARACTER(len=*), INTENT(in) :: name,longname,unit
-        INTEGER :: err, dimid, did
-        err = nf90_def_dim(SELF%ncid, name, NF90_UNLIMITED, dimid)
-        err = nf90_def_var(SELF%ncid, name, NF90_FLOAT, dimid, did)
-        err = nf90_put_att(SELF%ncid, did, 'longname', longname)
-        err = nf90_put_att(SELF%ncid, did, 'units'   , unit)      
-    END SUBROUTINE define_record
+    ! ------------------------------------------------------------
+    ! Update the record index. Call this before calling write_var
+    !
+    SUBROUTINE newRecord(SELF,record)
+        USE classFieldArray, ONLY : FieldArray
+        CLASS(OStreamNCDF) :: SELF
+        TYPE(FieldArray), INTENT(inout) :: record
+        SELF%nrec = SELF%nrec + 1 
+        CALL SELF%write_var(record)
+    END SUBROUTINE newRecord
+
 
     ! -------------------------------
 
-    SUBROUTINE define_dimensions(SELF,dims)
+    SUBROUTINE define_dimensions(SELF,dims,recGrp)
         USE classFieldArray, ONLY : FieldArray
         CLASS(OStreamNCDF), INTENT(inout) :: SELF
-        TYPE(FieldArray), INTENT(in) :: dims
+        TYPE(FieldArray), INTENT(inout) :: dims
+        CHARACTER(len=*), INTENT(in), OPTIONAL :: recGrp
         INTEGER :: i, n, err, did
+        CHARACTER(len=10) :: recg_ 
+        INTEGER, ALLOCATABLE :: counts_(:)
+
+        recg_ = ""
+        IF (PRESENT(recGrp)) recg_ = recGrp
 
         n = dims%count
         DO i = 1,n
-            err = nf90_def_dim(SELF%ncid, dims%getName(i), &
-                               dims%getCountsLocal(i), did)
+            IF (dims%isInGroup(recg_,i)) THEN
+                err = nf90_def_dim(SELF%ncid, dims%getName(i), &
+                                   NF90_UNLIMITED, did)
+                SELF%recdid = did
+            ELSE
+                counts_ = dims%getCountsLocal(i)
+                err = nf90_def_dim(SELF%ncid, dims%getName(i), &
+                                   counts_(1), did)
+                DEALLOCATE(counts_)
+            END IF 
+
         END DO
 
     END SUBROUTINE define_dimensions
@@ -103,6 +131,7 @@ MODULE classOStreamNCDF
         INTEGER, ALLOCATABLE :: dimid(:)
 
         ! Check if vars%count > 0?
+        ! Should also take care of the case where continuing pre-existing file
 
         DO i = 1,vars%count
             CALL SELF%get_dimids(vars%getDimension(i),dimid)
@@ -115,6 +144,62 @@ MODULE classOStreamNCDF
     END SUBROUTINE define_variables
 
     ! -------------------------------
+
+    SUBROUTINE write_var(SELF,vars)
+        USE classFieldArray, ONLY : FieldArray
+        USE mo_structured_datatypes
+        CLASS(OStreamNCDF), INTENT(in) :: SELF
+        TYPE(FieldArray), INTENT(inout) :: vars
+
+        CLASS(FloatArray), POINTER :: pp
+        INTEGER :: err, n, i, varid
+        INTEGER, ALLOCATABLE :: beg(:), count(:)
+
+        pp => NULL()
+        n = vars%count
+
+        DO i = 1,n
+
+            err = nf90_inq_varid(SELF%ncid,vars%getName(i),varid)
+
+            CALL vars%getVarInst(pp, i, 1)
+            beg = vars%getOffsets(i)
+            count = vars%getCountsLocal(i)  
+
+            IF (ASSOCIATED(pp%onDemand)) THEN
+                CALL pp%allocate_internal(SELF%excludeRecord(count,varid))  
+                CALL pp%onDemand()
+            END IF
+            CALL SELF%updateOffset(beg,varid)
+            !! SET_OFFSET to update the variable instance??
+
+
+            SELECT TYPE(pp)
+                TYPE IS (FloatArray0d)
+                    err = nf90_put_var(SELF%ncid,varid,pp%d,start=beg)
+                TYPE IS (FloatArray1d)                   
+                    err = nf90_put_var(SELF%ncid,varid,pp%d,start=beg,count=count)
+                TYPE IS (FloatArray2d)                 
+                    err = nf90_put_var(SELF%ncid,varid,pp%d,start=beg,count=count)
+                TYPE IS (FloatArray3d)                   
+                    err = nf90_put_var(SELF%ncid,varid,pp%d,start=beg,count=count)
+                TYPE IS (FloatArray4d)                  
+                    err = nf90_put_var(SELF%ncid,varid,pp%d,start=beg,count=count)
+            END SELECT
+
+            IF (ASSOCIATED(pp%onDemand)) CALL pp%free_memory()            
+
+            pp => NULL()
+            DEALLOCATE(beg,count)
+
+        END DO
+
+    END SUBROUTINE write_var
+
+
+
+    ! PRIVATE routines
+    ! ------------------------------------------------------------
 
     SUBROUTINE get_dimids(SELF,dims,ids)
         CLASS(OStreamNCDF), INTENT(in) :: SELF
@@ -131,65 +216,59 @@ MODULE classOStreamNCDF
 
     END SUBROUTINE get_dimids
 
-    ! ------------
-
-    SUBROUTINE write_new_record(SELF,name,val)
-        CLASS(OStreamNCDF) :: SELF
-        CHARACTER(len=*), INTENT(in) :: name
-        REAL, INTENT(in) :: val
-        INTEGER :: err,did
-        SELF%nrec = SELF%nrec + 1
-        err = nf90_inq_varid(SELF%ncid,name,did)
-        err = nf90_put_var(SELF%ncid,did,val,start=SELF%nrec)
-    END SUBROUTINE write_new_record
-
-    ! -------------
-
-    SUBROUTINE write_var(SELF,vars)
-        USE classFieldArray, ONLY : FieldArray
-        USE mo_structured_datatypes
+    ! ------------------------------------------------------------
+    ! findRecordIdx: Find the index for the record dimension
+    !                in the dimension vector for given variable
+    !
+    FUNCTION findRecordIdx(SELF,varid)
+        !!! OLISKO VAAN HELPOMPI TALLENTAA NIMI JA ETTIÄ SILLÄ SUORAAN
+        !!! FIELDARRAY INSTANSSISTA?
         CLASS(OStreamNCDF), INTENT(in) :: SELF
-        TYPE(FieldArray), INTENT(in) :: vars
-
-        CLASS(FloatArray), POINTER :: pp
-        INTEGER :: err, n, i, did
-        INTEGER, ALLOCATABLE :: beg(:), count(:)
-
-        pp => NULL()
-        n = vars%count
-
-        DO i = 1,n
-            beg = [vars%getOffsets(i),SELF%nrec]
-            count = [vars%getCountsLocal(i),1]  
-            CALL vars%getVarInst(pp, i, 1)
-
-            IF (ASSOCIATED(pp%onDemand)) THEN
-                CALL pp%allocate_internal(vars%getCountsLocal(i))
-                CALL pp%onDemand()
-            END IF
-
-            err = nf90_inq_varid(SELF%ncid,vars%getName(i),did)
-            SELECT TYPE(pp)
-                TYPE IS (FloatArray0d)
-                    err = nf90_put_var(SELF%ncid,did,pp%d,start=beg,count=count)
-                TYPE IS (FloatArray1d)                   
-                    err = nf90_put_var(SELF%ncid,did,pp%d,start=beg,count=count)
-                TYPE IS (FloatArray2d)                 
-                    err = nf90_put_var(SELF%ncid,did,pp%d,start=beg,count=count)
-                TYPE IS (FloatArray3d)                   
-                    err = nf90_put_var(SELF%ncid,did,pp%d,start=beg,count=count)
-                TYPE IS (FloatArray4d)                  
-                    err = nf90_put_var(SELF%ncid,did,pp%d,start=beg,count=count)
-            END SELECT
-
-            IF (ASSOCIATED(pp%onDemand)) CALL pp%free_memory()            
-
-            pp => NULL()
-            DEALLOCATE(beg,count)
-
+        INTEGER, INTENT(in) :: varid
+        INTEGER, ALLOCATABLE :: dimids(:)  ! just allocate enough space to be sure to cover all possibilities... 
+        INTEGER :: err,i,ndims
+        INTEGER :: findRecordIdx      
+        err = nf90_inquire_variable(SELF%ncid,varid,ndims=ndims)
+        ALLOCATE(dimids(ndims+1)) ! +1 for error handling
+        err = nf90_inquire_variable(SELF%ncid,varid,dimids=dimids)
+        findRecordIdx = -1
+        DO i = 1,ndims+1
+            findRecordIdx = i
+            IF (dimids(i) == SELF%recdid) EXIT 
         END DO
+        IF (findRecordIdx == ndims+1) findRecordIdx = -1 ! Record dimension not found 
+        DEALLOCATE(dimids)   
+    END FUNCTION findRecordIdx
 
-    END SUBROUTINE write_var
+    ! ------------------------------------------------------------
+    ! Update the variable offset to the current record.
+    !
+    SUBROUTINE updateOffset(SELF,beg,varid)
+        CLASS(OStreamNCDF) :: SELF 
+        INTEGER, INTENT(inout) :: beg(:)
+        INTEGER, INTENT(in) :: varid  
+        INTEGER :: recidx 
+        recidx = SELF%findRecordIdx(varid)
+        IF (recidx /= -1) beg(recidx) = SELF%nrec
+    END SUBROUTINE updateOffset 
+
+    ! -------------------------------------------------------------
+    ! excludeRecord: get count or start index arrays excluding
+    ! the record dimension. Arr will be the original array.
+    !
+    FUNCTION excludeRecord(SELF,arr,varid)
+        CLASS(OStreamNCDF) :: SELF
+        INTEGER, INTENT(in) :: arr(:)
+        INTEGER, INTENT(in) :: varid
+        INTEGER, ALLOCATABLE :: excludeRecord(:)
+        LOGICAL, ALLOCATABLE :: mask(:)
+        INTEGER :: recidx
+        recidx = SELF%findRecordIdx(varid)
+        ALLOCATE(mask(SIZE(arr))); mask = .TRUE.
+        IF (recidx /= -1) mask(recidx) = .FALSE.
+        ALLOCATE(excludeRecord,SOURCE=PACK(arr,mask))
+        DEALLOCATE(mask)
+    END FUNCTION excludeRecord
 
 
 END MODULE classOStreamNCDF

@@ -3,8 +3,16 @@ PROGRAM main
     USE mo_structured_datatypes
     USE test_procedures
     USE mo_parameters
+
+    ! Test list:
+    ! different storage options
+    ! Grouping, fetching by group
+    ! Fetching by output status
+
     IMPLICIT NONE
     ! Test the polymorphic variable declarations
+
+    CHARACTER(len=6), PARAMETER :: recGrp = "record"
 
     TYPE(FieldArray) :: manager
 
@@ -13,11 +21,12 @@ PROGRAM main
     TYPE(FloatArray1d), TARGET :: od1d
 
     REAL, TARGET :: data1d(nzp)
-    
+    REAL, TARGET :: data1d_2(nzp)
 
     TYPE(FieldArray) :: dim_manager
 
     TYPE(FloatArray1d), TARGET :: zt
+    TYPE(FloatArray0d), TARGET :: time 
 
     REAL, TARGET :: dimdata(nzp) ! just 1d here...
 
@@ -25,9 +34,11 @@ PROGRAM main
 
     INTEGER :: k
 
+
     pipeline => NULL()
 
     data1d = 1000000.
+    data1d_2 = 2000000.
 
     DO k = 1,nzp
         dimdata(k) = REAL(k)
@@ -37,35 +48,50 @@ PROGRAM main
     manager = FieldArray()
     dim_manager = FieldArray()
 
-    ! Initialize axis variables and register with dim manager
+    ! Initialize dimension variables and register with dim manager
+    time = FloatArray0d("time")
+    CALL time%allocate_internal([1])
+    pipeline => time
+    CALL dim_manager%newField(time%shortname,["time"],[1],[1],[1],pipeline,      &
+                              outputstatus=.TRUE.,long_name="time",unit="s",     &
+                              group=[recGrp])  ! Assigning recGrp makes this the record variable. 
+                                             ! This can only have one variable, otherwise the 
+                                             ! IO routines will fail at least for netcdf.
+
+    pipeline => NULL()
     zt = FloatArray1d("zt", trgt=dimdata)
     pipeline => zt 
     CALL dim_manager%newField(zt%shortName,["zt"],[nzp],[nzp],[1],pipeline,      &
                               outputstatus=.TRUE.,long_name="zt",unit="m")
-
-
+   
 
     ! Initialize variables and register with the manager
     external1d = FloatArray1d("v1d_1", trgt=data1d)
     pipeline => external1d
-    CALL manager%newField(external1d%shortName,["zt"],[nzp],[nzp],[1],pipeline,  &
+    CALL manager%newField(external1d%shortName,["zt  ","time"],[nzp,1],[nzp,1],[1,1],pipeline,  &
                           outputstatus=.TRUE.,long_name="v1d testaan",unit="v1d unit")
 
+    pipeline => NULL()
     store1d = FloatArray1d("v1d_2")
     CALL store1d%allocate_internal([nzp])
     store1d%d(:) = 1000.
     pipeline => store1d
-    CALL manager%newField(store1d%shortName,["zt"],[nzp],[nzp],[1],pipeline,  &
+    CALL manager%newField(store1d%shortName,["zt  ","time"],[nzp,1],[nzp,1],[1,1],pipeline,  &
                           outputstatus=.TRUE.,long_name="v1d testaan 2",unit="v1d unit 2")
                    
     od1d = FloatArray1d("v1d_3",func=compute_some_profile)
     pipeline => od1d
-    CALL manager%newField(od1d%shortName,["zt"],[nzp],[nzp],[1],pipeline,  &
+    CALL manager%newField(od1d%shortName,["zt  ","time"],[nzp,1],[nzp,1],[1,1],pipeline,  &
                           outputstatus=.TRUE.,long_name="v1d testaan 3",unit="v1d unit 3")
 
-    CALL make_nc(dim_manager, manager)
 
-    CALL test(manager)
+    CALL make_h5(dim_manager, manager, time, recGrp)
+
+    !CALL make_nc(dim_manager, manager, time, recGrp)
+
+
+
+    !CALL test(manager)
 
     pipeline => NULL()
     CALL store1d%free_memory()
@@ -74,7 +100,7 @@ PROGRAM main
     CONTAINS
 
     SUBROUTINE test(mngr)
-        TYPE(FieldArray), INTENT(in) :: mngr
+        TYPE(FieldArray), INTENT(inout) :: mngr
 
         CLASS(FloatArray), POINTER :: pp 
         pp => NULL()
@@ -112,32 +138,77 @@ PROGRAM main
     END SUBROUTINE test
 
 
-    SUBROUTINE make_nc(dim_mngr,mngr)
+    SUBROUTINE make_nc(dim_mngr,mngr,time_,recGrp_)
         USE classOStreamNCDF, ONLY : OStreamNCDF
-        TYPE(FieldArray), INTENT(in) :: dim_mngr
-        TYPE(FieldArray), INTENT(in) :: mngr 
+        TYPE(FieldArray), INTENT(inout) :: dim_mngr
+        TYPE(FieldArray), INTENT(inout) :: mngr
+        TYPE(FloatArray0d), INTENT(inout) :: time_  
+        CHARACTER(len=*), INTENT(in) :: recGrp_
 
+        TYPE(FieldArray) :: record 
         TYPE(OStreamNCDF) :: ncid
 
         INTEGER :: t
  
         ncid = OStreamNCDF("testi.nc")
 
-        CALL ncid.open_nc()
+        CALL ncid%open_nc()
 
-        CALL ncid.define_record("time","time","s")
-        CALL ncid.define_dimensions(dim_mngr)
-        CALL ncid.define_variables(mngr)
+        CALL ncid%define_dimensions(dim_mngr,recGrp_)
 
+        CALL ncid%define_variables(dim_mngr)
+        CALL ncid%define_variables(mngr)
+
+        CALL ncid%finalize_init()
+
+        CALL ncid%write_var(dim_mngr)  ! Write out the non-record variables. Only needed once
+
+        CALL dim_mngr%getByGroup(recGrp_,record)  ! Extract the record variable in its own FieldArray instance
         DO t = 1,5
-            CALL ncid.write_new_record("time",t*60.)
-            CALL ncid.write_var(mngr)
-            CALL ncid.sync_nc()
+            time_%d = REAL(t)   !!! Incrementing time would be in the timestepping loop of the model
+            CALL ncid%newRecord(record) ! These 3 are the actual call that would be in the output routine
+            CALL ncid%write_var(mngr)
+            CALL ncid%sync_nc()
         END DO 
 
-        CALL ncid.close_nc()
+        CALL ncid%close_nc()
 
     END SUBROUTINE make_nc
+
+    ! ----------------------------------------------------------
+
+    SUBROUTINE make_h5(dim_mngr,mngr,time_,recGrp_)
+        USE classOStreamHDF5, ONLY : OStreamHDF5  
+        TYPE(FieldArray), INTENT(inout) :: dim_mngr
+        TYPE(FieldArray), INTENT(inout) :: mngr
+        TYPE(FloatArray0d), INTENT(inout) :: time_  
+        CHARACTER(len=*), INTENT(in) :: recGrp_
+
+        TYPE(FieldArray) :: record 
+        TYPE(OStreamHDF5) :: h5id
+
+        INTEGER :: t
+
+        h5id = OStreamHDF5("testi.h5")
+
+        CALL h5id%open_h5()
+
+        CALL h5id%define_dimensions(dim_mngr,recGrp_)
+
+        CALL h5id%define_variables(mngr)
+
+        CALL dim_mngr%getByGroup(recGrp_,record)  ! Extract the record variable in its own FieldArray instance
+        DO t = 1,5
+            time_%d = REAL(t)
+            CALL h5id%newRecord(record)
+            CALL h5id%write_var(mngr)
+        END DO 
+
+        CALL h5id%close_h5()
+
+
+    END SUBROUTINE make_h5
+
 
 
 
