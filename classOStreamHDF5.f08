@@ -6,17 +6,14 @@ MODULE classOStreamHDF5
     !USE h5lt
     IMPLICIT NONE 
 
-    INTEGER, PARAMETER :: nds = 5 ! Max number of dataspace instances 
     INTEGER, PARAMETER :: undef = -1
-
 
     TYPE OStreamHDF5
 
         INTEGER(HID_T) :: h5id = 0
         CHARACTER(len=ch_long) :: fname ! Output filename for the stream
         INTEGER :: nrec
-        CHARACTER(len=ch_short) :: drecname  ! record dimension name. For now assume there's just one, could extend later...
-        !INTEGER(HID_T) :: dspace(nds) = undef  ! dataspace instaces from 1 to 5d by index (including time)
+        CHARACTER(len=ch_short) :: drecname  ! record dimension name. For now assume there's just one, could extend later..
 
         CONTAINS
 
@@ -25,11 +22,13 @@ MODULE classOStreamHDF5
                      define_variables,    &
                      write_var,           &
                      newRecord
-                     !close_dataspaces
+
     
         PROCEDURE, PRIVATE :: findRecordIdx,    &
                               excludeRecord,    &
-                              updateOffset
+                              updateOffset,     &
+                              extendUnlimited,  &
+                              attachDimensionScales
 
 
     END TYPE OStreamHDF5
@@ -61,7 +60,7 @@ MODULE classOStreamHDF5
         CALL h5fcreate_f(SELF%fname, H5F_ACC_TRUNC_F, SELF%h5id, err, access_prp=filespace )
         ! Close the file property list instance
         CALL h5pclose_f(filespace, err)
-        SELF%nrec = 0  !! This has to have some additional stuff for opening pre-existing files
+        SELF%nrec = -1  !! This has to have some additional stuff for opening pre-existing files
     END SUBROUTINE open_h5
 
     ! -----------------------------------
@@ -116,7 +115,7 @@ MODULE classOStreamHDF5
         CLASS(OStreamHDF5), INTENT(inout) :: SELF
         TYPE(FieldArray), INTENT(inout) :: vars
         INTEGER :: i,n,err,ridx
-        INTEGER(HID_T), ALLOCATABLE :: gcounts_(:), lcounts_(:), maxdims_(:)
+        INTEGER(HSIZE_T), ALLOCATABLE :: gcounts_(:), lcounts_(:), maxdims_(:)
         INTEGER(HID_T) :: did, dcpl, dspace
 
         ! Check if vars%count > 0?
@@ -141,6 +140,9 @@ MODULE classOStreamHDF5
                                                              
             CALL h5dcreate_f(SELF%h5id, vars%getName(i), H5T_NATIVE_REAL, &
                              dspace, did, err, dcpl_id = dcpl)
+
+            write(*,*) vars%getDimension(i)
+            CALL SELF%attachDimensionScales(did,vars%getDimension(i))
 
             CALL h5dclose_f(did,err)
             CALL h5sclose_f(dspace,err)
@@ -184,40 +186,42 @@ MODULE classOStreamHDF5
             lc_exrec = SELF%excludeRecord(lcounts,vars%getDimension(i))
             offsets = INT(vars%getOffsets(i),KIND=HSIZE_T)
 
-            WRITE(*,*) 'HEP'
-            CALL h5dopen_f(SELF%h5id,vars%getName(i),varid,err)
-            CALL h5dget_space_f(varid,dspace,err)
-            WRITE(*,*) 'HEP2'
+            CALL h5dopen_f(SELF%h5id,vars%getName(i),varid,err)            
 
             IF (ASSOCIATED(pp%onDemand)) THEN
                 CALL pp%allocate_internal(INT(lc_exrec))  
                 CALL pp%onDemand()
             END IF
-            CALL SELF%updateOffset(offsets,vars%getDimension(i))
-            !! SET_OFFSET to update the variable instance??
 
-            CALL h5sselect_hyperslab_f(dspace,H5S_SELECT_SET_F,offsets,lcounts,err)
+            ! Only necessary if variable has a record dimension
+            IF (SELF%findRecordIdx(vars%getDimension(i)) /= undef) THEN
+                CALL SELF%updateOffset(offsets,vars%getDimension(i))
+                CALL SELF%extendUnlimited(varid,vars%getCountsGlobal(i),vars%getDimension(i))
+            END IF
 
             nd = SIZE(lcounts)
             CALL h5screate_simple_f(nd,lcounts,mspace,err)
 
+            CALL h5dget_space_f(varid,dspace,err)
+            CALL h5sselect_hyperslab_f(dspace,H5S_SELECT_SET_F,offsets,lcounts,err)
+
             SELECT TYPE(pp)
             TYPE IS(FloatArray0d)
-                CALL h5dwrite_f( varid,H5T_NATIVE_REAL,pp%d,lc_exrec,err,   &
+                CALL h5dwrite_f( varid,H5T_NATIVE_REAL,pp%d,lcounts,err,   &
                                  file_space_id=dspace,mem_space_id=mspace   )
             TYPE IS(FloatArray1d)
-                CALL h5dwrite_f( varid,H5T_NATIVE_REAL,pp%d,lc_exrec,err,   &
+                CALL h5dwrite_f( varid,H5T_NATIVE_REAL,pp%d,lcounts,err,   &
                                  file_space_id=dspace,mem_space_id=mspace   )
             TYPE IS(FloatArray2d)
-                CALL h5dwrite_f( varid,H5T_NATIVE_REAL,pp%d,lc_exrec,err,   &
+                CALL h5dwrite_f( varid,H5T_NATIVE_REAL,pp%d,lcounts,err,   &
                                  file_space_id=dspace,mem_space_id=mspace   )
             TYPE IS(FloatArray3d)
-                CALL h5dwrite_f( varid,H5T_NATIVE_REAL,pp%d,lc_exrec,err,   &
+                CALL h5dwrite_f( varid,H5T_NATIVE_REAL,pp%d,lcounts,err,   &
                                  file_space_id=dspace,mem_space_id=mspace   )
             TYPE IS(FloatArray4d)
-                CALL h5dwrite_f( varid,H5T_NATIVE_REAL,pp%d,lc_exrec,err,   &
+                CALL h5dwrite_f( varid,H5T_NATIVE_REAL,pp%d,lcounts,err,   &
                                  file_space_id=dspace,mem_space_id=mspace   )
-            END SELECT            
+            END SELECT       
 
             IF (ASSOCIATED(pp%onDemand)) CALL pp%free_memory()            
             pp => NULL()
@@ -229,30 +233,15 @@ MODULE classOStreamHDF5
 
     END SUBROUTINE write_var 
 
-
-
-    ! --------------------------------------------------
-
-    !SUBROUTINE close_dataspaces(SELF)
-    !    CLASS(OStreamHDF5), INTENT(inout) :: SELF
-    !    INTEGER :: i,err  
-    !    ! Close all dataspaces
-    !    DO i = 1,nds 
-    !        IF (SELF%dspace(i) /= undef) THEN 
-    !            CALL h5sclose_f(SELF%dspace(i),err)
-    !            SELF%dspace(i) = undef
-    !        END IF
-    !    END DO 
-
-    !END SUBROUTINE close_dataspaces 
-
     ! --------------------------------------------------
 
     SUBROUTINE close_h5(SELF)
         CLASS(OStreamHDF5), INTENT(inout) :: SELF
         INTEGER :: err 
+
         CALL h5fclose_f(SELF%h5id,err)
         CALL h5close_f(err)
+        
     END SUBROUTINE close_h5 
 
 
@@ -285,11 +274,13 @@ MODULE classOStreamHDF5
         INTEGER(HSIZE_T), ALLOCATABLE :: excludeRecord(:)
         LOGICAL, ALLOCATABLE :: mask(:)
         INTEGER :: ridx
+
         ridx = SELF%findRecordIdx(dims_)
         ALLOCATE(mask(SIZE(counts_))); mask = .TRUE.
         IF (ridx /= undef) mask(ridx) = .FALSE.
         ALLOCATE(excludeRecord,SOURCE=PACK(counts_,mask))
         DEALLOCATE(mask)
+
     END FUNCTION excludeRecord
 
     ! ------------------------------------------------------------
@@ -300,9 +291,52 @@ MODULE classOStreamHDF5
         INTEGER(HSIZE_T), INTENT(inout) :: offsets_(:)
         CHARACTER(len=*), INTENT(in) :: dims_(:)
         INTEGER :: ridx 
+
         ridx = SELF%findRecordIdx(dims_)
         IF (ridx /= undef) offsets_(ridx) = SELF%nrec
+
     END SUBROUTINE updateOffset 
+
+    ! ---------------------------------------------------------------------------
+    ! Update the total size of the variable to extend the unlimited dimensions
+    !
+    SUBROUTINE extendUnlimited(SELF,varid,counts_,dims_)
+        CLASS(OStreamHDF5) :: SELF 
+        INTEGER(HID_T), INTENT(in) :: varid
+        INTEGER, INTENT(in) :: counts_(:)
+        CHARACTER(len=*), INTENT(in) :: dims_(:)
+        INTEGER(HSIZE_T), ALLOCATABLE :: newsize(:)
+        INTEGER :: ridx,err
+
+        ridx = SELF%findRecordIdx(dims_)
+        newsize = INT(counts_,KIND=HSIZE_T)
+        newsize(ridx) = SELF%nrec+1
+        CALL h5dset_extent_f(varid,newsize,err)
+        DEALLOCATE(newsize)
+
+    END SUBROUTINE extendUnlimited 
+
+    ! --------------------------------------------------------------
+    ! Attach dimension scales
+    !
+    SUBROUTINE attachDimensionScales(SELF,varid,dims_)
+        CLASS(OStreamHDF5) :: SELF
+        INTEGER(HID_T), INTENT(in) :: varid
+        CHARACTER(LEN=*), INTENT(in) :: dims_(:)
+        INTEGER(HID_T) :: dsid
+        INTEGER :: i,irev,N,err
+
+        N = SIZE(dims_)
+        DO i = 1,N
+            irev = N-(i-1)
+           CALL h5dopen_f(SELF%h5id,dims_(i),dsid,err)
+           CALL h5dsattach_scale_f(varid,dsid,irev,err) ! For some reason the dim indexing needs to be reversed!? 
+                                                        ! Something to do with row vs column major ordering between
+                                                        ! Fortran and hdf5 (C?) implementation?
+           CALL h5dclose_f(dsid,err)
+        END DO 
+
+    END SUBROUTINE attachDimensionScales
 
 
 END MODULE classOStreamHDF5

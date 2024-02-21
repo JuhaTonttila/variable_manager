@@ -6,5 +6,6 @@ MODULE mo_parameters
                           ch_long = 200
 
     INTEGER, PARAMETER :: nxp = 5, nyp = 4, nzp = 3
+    INTEGER, PARAMETER :: nxpg = 20, nypg = 16
 
 END MODULE mo_parameters
